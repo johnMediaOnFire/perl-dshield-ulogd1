@@ -1,4 +1,4 @@
-# READMEL: perl-dshield-ulogd1
+# README: perl-dshield-ulogd1
 
 ## Description
 
