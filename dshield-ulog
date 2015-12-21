@@ -1,0 +1,730 @@
+#!/usr/bin/perl
+
+# dshield-ulog -- submit iptables/ulog firewall logs to dshield.org
+
+# Description: Designed to be run out of cron, this script scrapes the
+# mysql database used by iptables/ulogd to store the firewall entries,
+# formats the entries, then submits them to dshield.org.
+#
+# The configurable items for this script are stored in /etc/dshield-ulog.conf
+# and in ~/.dshield-ulogrc. It first reads the file /etc then the one in your
+# home directory.
+#
+# `dshield-ulog -h` will give a list of options.
+#
+# License: GPL. Please see the terms at the end of this file.
+# Copyright (C) 2003 John W. Palmieri (john@mediaOnFire.com)
+#
+# Revision history:
+# 20 Aug 03 JohnP    : (0.1) Initial.
+
+my $VERSION = 0.1;
+
+# pragmas
+use warnings;
+use strict;
+
+# modules
+use Getopt::Std;
+use DBI;
+use Socket qw(inet_ntoa);
+use POSIX qw(strftime);
+
+# constants
+use constant DEFAULT_EMAIL  => 'reports@dshield.org';
+use constant DEFAULT_MAILER => '/usr/sbin/exim';
+use constant DEFAULT_PORT   => 3306;
+use constant DEFAULT_PERIOD => 6;
+use constant DEFAULT_CACHE  => '/var/cache/dshield-ulog';
+use constant DEFAULT_OBFUS  => 'none';
+    # Default configuration options. See the example config file for
+    # descriptions.
+use constant CACHE_FILE => 'dshield-ulog.cache';
+    # The cache filename.
+my $OBFUS_IP_FIRST = '10';
+my $OBFUS_IP       = '10.0.0.1';
+    # These are the obfuscated IP addresses.
+use constant ETC_CONF  => '/etc/dshield-ulog.conf';
+use constant HOME_CONF => '.dshield-ulogrc';
+    # These paths point to the default configuration file locations. The
+    # HOME_CONF entry is prepended with the user's home directory from his or
+    # her environment.
+my $CONFIG_OPTIONS =
+'^(userid|mailer|email|cc|host|username|password|maxperiod|cache|obfuscation)$';
+    # Regex to check configuration options.
+my $OBFUS_OPTIONS = '^(none|partial|complete)$';
+    # Regex to check configuration options.
+my $BOOLS = '^()$';
+    # For future use in configuration files.
+use constant DS_DATE        => 0;
+use constant DS_AUTHOR      => 1;
+use constant DS_COUNT       => 2;
+use constant DS_SOURCE_IP   => 3;
+use constant DS_SOURCE_PORT => 4;
+use constant DS_TARGET_IP   => 5;
+use constant DS_TARGET_PORT => 6;
+use constant DS_PROTOCOL    => 7;
+use constant DS_FLAGS       => 8;
+    # These are the field positions, zero based, for the dshield.org
+    # submission lines.
+
+use constant YES => 1;
+use constant NO  => 0;
+
+# Globals
+my $Prog;
+    # Holds the script name.
+my $Debug;
+    # YES if debug output should be generated.
+my $Now_secs;
+    # The current time, in seconds, used in the script.
+
+# main
+{
+    my %config;
+    my @entries;
+    my @entry_list;
+    my $period;
+
+    # set the globals
+    ($Prog = $0) =~ s#^.*/##;
+    $Debug = NO;
+    $Now_secs = time();
+
+    parseArguments(\%config);
+
+    readConfigs(\%config);
+
+    checkDefaults(\%config);
+
+    $Debug and printConfig(\%config);
+
+    $period = checkPeriod(\%config);
+    $Debug and print STDERR 'Period of scrape: ', $period/3600, " hours\n";
+
+    scrapeDatabase(\%config, $period, \@entries);
+    $Debug and print STDERR "Scraped ", scalar(@entries),
+                            " entries from ulog\n";
+
+    # The filterEntries() routine will eventually cull log entries that
+    # should not be submitted to dshield.org. It is currently not implemented
+    # since I only log stuff that should be submitted.
+#   filterEntries(\%entries);
+
+    buildEntryList(\%config, \@entries, \@entry_list);
+    $Debug and print STDERR "Built ", scalar(@entry_list), " dshield entries\n";
+
+    $Debug and printList(\@entries, \@entry_list);
+
+    sendEntryList(\%config, \@entry_list);
+
+    updatePeriod(\%config);
+
+    exit(0);
+}
+
+sub fatalReport
+    # Prints an error message to appropriate stream then exits.
+    # Parameters:
+    # - message
+    # Returns: void
+{
+    my ($msg) = @_;
+
+    print STDERR $msg, "\n";
+
+    exit(1);
+}
+
+#########################################################################
+# Routines to handle the configuration of the script.
+#########################################################################
+
+sub parseArguments
+    # Parse the command line arguments.
+    # Parameters:
+    # - reference to a hash to hold the values
+    # Returns: void
+{
+    my ($ref) = @_;
+
+    my %opts;
+
+    getopts('DVhC:', \%opts);
+
+    $opts{'D'} and $Debug = YES;
+
+    $opts{'V'} and die "$Prog\n  Version: $VERSION\n";
+
+    $ref->{'config'}  = $opts{'C'}; # undef if not specified
+
+    $opts{'h'} and die "usage: $Prog [-V] [-C file] [-D] [-h]\n"        .
+                       "    -V : show version information\n"    .
+                       "    -C : use this configuration file\n" .
+                       "    -D : print debugging information\n" .
+                       "    -h : show this usage\n";
+}
+
+sub readConfigs
+    # Wrapper to read the configuration files specified as defaults or
+    # by the user.
+    # Parameters:
+    # - ref to configuration hash
+    # Returns: void
+{
+    my ($ref) = @_;
+
+    if (defined($ref->{'config'}))
+    {   # command line arg for config file
+        readConfig($ref->{'config'}, $ref);
+    }
+    else
+    {   # use the default ones
+        readConfig(ETC_CONF, $ref);
+        readConfig($ENV{'HOME'} . '/' . HOME_CONF, $ref);
+    }
+}
+
+sub readConfig
+    # Parses the configuration file and loads up the config hash.
+    # Parameters:
+    # - configuration filename
+    # - ref to configuration hash
+    # Returns: void
+    # Will die on bad configuration.
+{
+    my ($cfile, $ref) = @_;
+
+    my ($fd, $line_num, $line, @tokens, $opt);
+
+    open($fd, '<', $cfile) || return;
+
+    $line_num =0;
+    while ($line = <$fd>)
+    {
+        $line_num++;
+        chomp($line);
+
+        @tokens = ();
+        tokenize($cfile, $line, $line_num, \@tokens) || next;
+#print $line, "\n", join(' ', @tokens), "\n";
+
+        fatalReport("$cfile: too many configuration options at line $line_num")
+                    if (scalar(@tokens) != 2);
+        fatalReport("$cfile: unknown configuration option at line $line_num")
+                    if ($tokens[0] !~ /$CONFIG_OPTIONS/);
+
+        if ($tokens[1] =~ /^yes$/i)   { $opt = YES; }
+        elsif ($tokens[1] =~ /^no$/i) { $opt = NO; }
+        else                          { $opt = $tokens[1]; }
+
+        $ref->{$tokens[0]} = $opt;
+    }
+    close($fd);
+}
+
+sub tokenize
+    # Takes the input string and breaks it into tokens. A token is separated
+    # by whitespace, or whitespace may be incorporated into a token by
+    # surrounding it with double quoutation marks. A comment char (#) outside
+    # of quotation marks indicates the end of processing.
+    # Parameters:
+    # - configuration file name (used in error messages)
+    # - string to be tokenized
+    # - line number for error messages
+    # - reference to array to hold the tokens
+    # Returns: true if tokens were found, otherwise undef
+{
+    my ($cfile, $line, $line_num, $ref) = @_;
+
+    my ($token, @chars, $inQuote);
+
+    @chars = split(//, $line);
+
+    $inQuote = undef;
+    $token   = undef;
+    foreach (@chars)
+    {
+        if (/#/ && ! $inQuote)
+        {   # comment for rest of line
+            last;
+        }
+        elsif (/\s/)
+        {   # whitespace
+            if ($inQuote)
+            {   # just add it
+                $token .= $_;
+            }
+            elsif ($token)
+            {   # we're done with this token
+                push( @{ $ref }, $token);
+                $token = undef;
+            }
+            else
+            {   # ignore
+                next;
+            }
+        }
+        elsif (/"/)
+        {   # conglomerated token
+            if ($inQuote)
+            {   # we're done with this token
+                push( @{ $ref }, $token) if ($token);
+                $token = $inQuote = undef;
+            }
+            else
+            {   # entering into a quotation
+                $inQuote = YES;
+            }
+        }
+        else
+        {   # token character
+            $token .= $_;
+        }
+    }
+
+    # clean-up any left over tokens
+    fatalReport("$cfile: missing quotation mark in configuration options at " .
+                "line $line_num")
+            if ($inQuote);
+    push( @{ $ref }, $token) if ($token);
+
+    return(undef) if (!defined($ref) || scalar(@{ $ref }) == 0);
+    return(1);
+}
+
+sub checkDefaults
+    # Checks that the required configuration options are set. For ones with
+    # a default value, if they are not set then the default is used.
+    # Also check that the options are valid.
+    # Parameters:
+    # - reference to configuration hash
+    # Returns: void
+{
+    my ($ref) = @_;
+
+    $ref->{'email'}        = $ref->{'email'}       || DEFAULT_EMAIL;
+    $ref->{'mailer'}       = $ref->{'mailer'}      || DEFAULT_MAILER;
+    $ref->{'port'}         = $ref->{'port'}        || DEFAULT_PORT;
+    $ref->{'maxperiod'}    = $ref->{'maxperiod'}   || DEFAULT_PERIOD;
+    $ref->{'cache'}        = $ref->{'cache'}       || DEFAULT_CACHE;
+    $ref->{'obfuscation'}  = $ref->{'obfuscation'} || DEFAULT_OBFUS;
+
+    badOption('obfuscation', $ref->{'obfuscation'})
+            if ($ref->{'obfuscation'} !~ $OBFUS_OPTIONS);
+
+    $ref->{'userid'}   or missingOption('userid');
+    $ref->{'host'}     or missingOption('host');
+    $ref->{'username'} or missingOption('username');
+    $ref->{'password'} or missingOption('password');
+
+    (-d $ref->{'cache'}) or fatalReport(
+               "The cache directory, $ref->{'cache'}, does not exist.\n" .
+               "Please create it.");
+
+    (-x $ref->{'mailer'}) or fatalReport(
+               "The mailer program, $ref->{'mailer'}, does not exist or\n" .
+               "is not executable. Please check the 'mailer' option.");
+}
+
+sub missingOption
+    # Prints an error message that a configuration option is missing.
+    # Parameters:
+    # - missing option
+    # Returns: exits
+{
+    my ($option) = @_;
+
+    print STDERR "The '$option' option is required and has not been\n" .
+                 "specified in one of the configuration files:\n" . 
+                 "    " . ETC_CONF . "\n" .
+                 "    " . $ENV{'HOME'} . '/' . HOME_CONF . "\n" .
+                 "    -or- as specified with the '-C' switch.\n";
+    exit(1);
+}
+
+sub badOption
+    # Prints an error message that a configuration option is incorrect.
+    # Parameters:
+    # - option name
+    # - option value
+    # Returns: exits
+{
+    my ($option, $value) = @_;
+
+    fatalReport( "The '$option' option is '$value', which is not allowed.\n" .
+                 "Please correct in one of the configuration files:\n" . 
+                 "    " . ETC_CONF . "\n" .
+                 "    " . $ENV{'HOME'} . '/' . HOME_CONF . "\n" .
+                 "    -or- as specified with the '-C' switch.\n");
+}
+
+sub printConfig
+    # Prints the configuration options for debugging purposes.
+    # Parameters:
+    # - reference to configuration hash
+    # Returns: void
+{
+    my ($ref) = @_;
+
+    my $opt;
+
+    print STDERR "Configuration options -\n";
+
+    foreach (sort keys( %{ $ref } ))
+    {
+        if ($_ =~ /$BOOLS/)
+        {
+            $opt = $ref->{$_} ? 'yes' : 'no';
+        }
+        else
+        {
+            $opt = $ref->{$_};
+        }
+
+        print STDERR "$_: ", $opt, "\n";
+    }
+}
+
+#########################################################################
+# Routines that handle the log entries.
+#########################################################################
+
+sub scrapeDatabase
+    # Scrapes the ulog database for the entries to send to dshield.org.
+    # Parameters:
+    # - reference to configuration hash
+    # - period in seconds to look back for entries
+    # - reference to entries array
+    # Returns: void
+{
+    my ($cref, $period, $ent_aref) = @_;
+
+    my ($dbh, $sth, $sref);
+
+    my $earliest = $Now_secs - $period;
+
+    # Note: RaiseError is 1, so script will bomb on database errors.
+
+    $dbh = DBI->connect("DBI:mysql:database=ulog;host=" . $cref->{'host'} .
+                        ';port=' . $cref->{'port'},
+                        $cref->{'username'},
+                        $cref->{'password'},
+                        { RaiseError => 1 } );
+
+    $sth =  $dbh->prepare(
+        "select oob_time_sec,ip_saddr,ip_daddr,tcp_sport,tcp_dport,"    .
+        "udp_sport,udp_dport,ip_protocol,icmp_type,icmp_code," .
+        "tcp_fin,tcp_syn,tcp_rst,tcp_psh,tcp_ack,tcp_urg"      .
+        " from ulog_packets" .
+        " where oob_time_sec > $earliest");
+    $sth->execute;
+
+    # save the entries
+    while ($sref = $sth->fetchrow_hashref())
+    {
+        push(@{ $ent_aref }, $sref);
+    }
+
+    $sth->finish;
+    $dbh->disconnect;
+}
+
+sub buildEntryList
+    # Takes the entries from the database and builds and array of arrays
+    # that contains the entries as they should be sent to dshield.org.
+    # Parameters:
+    # - reference to configuration hash
+    # - reference to databse entries array
+    # - reference to dshield.org entries array
+    # Returns: void
+{
+    my ($cref, $dbref, $eref) = @_;
+
+    my $entry;
+
+    my @sort_list = sort { $a->{'oob_time_sec'} <=> $b->{'oob_time_sec'} }
+                    (@{ $dbref });
+
+    @{ $eref } = ();
+
+    foreach $entry (@sort_list)
+    {
+        my @line;
+
+        $line[DS_DATE]        = formatDate($entry->{'oob_time_sec'});
+
+        $line[DS_AUTHOR]      = $cref->{'userid'};
+
+        $line[DS_COUNT]       = 1; # hmmm.... what's an identical record?
+
+        $line[DS_SOURCE_IP]   = inet_ntoa( (pack("N", $entry->{'ip_saddr'})) );
+
+        $line[DS_SOURCE_PORT] = source_port($entry);
+
+        $line[DS_TARGET_IP]   = destination($cref, $entry);
+
+        $line[DS_TARGET_PORT] = target_port($entry);
+
+        $line[DS_PROTOCOL]    = protocol($entry);
+
+        $line[DS_FLAGS]       = tcp_flags($entry);
+
+        push( @{ $eref }, \@line);
+    }
+}
+
+sub formatDate
+    # Converts the seconds from the database entry to the format used
+    # by dshield.org.
+    # Parameters:
+    # - time in seconds since the epoch
+    # Returns: dshield.org formatted timestamp
+{
+    my ($secs) = @_;
+
+    return strftime("%Y-%m-%d %T +00:00", gmtime($secs));
+}
+
+sub source_port
+    # Generates the source port field depending on the protocol.
+    # Parameters:
+    # - reference to entry hash
+    # Returns: correct source port field
+{
+    my ($ref) = @_;
+
+    for ( $ref->{'ip_protocol'} )
+    {
+        /^1$/  and return $ref->{'icmp_type'};
+        /^2$/  and return '???';
+        /^6$/  and return $ref->{'tcp_sport'};
+        /^17$/ and return $ref->{'udp_sport'};
+        return $ref->{'tcp_sport'} || $ref->{'udp_sport'} || '???';
+    }
+
+    return '???';
+}
+
+sub target_port
+    # Generates the target port field depending on the protocol.
+    # Parameters:
+    # - reference to entry hash
+    # Returns: correct target port field
+{
+    my ($ref) = @_;
+
+    for ( $ref->{'ip_protocol'} )
+    {
+        /^1$/  and return $ref->{'icmp_code'};
+        /^2$/  and return '???';
+        /^6$/  and return $ref->{'tcp_dport'};
+        /^17$/ and return $ref->{'udp_dport'};
+        return $ref->{'tcp_dport'} || $ref->{'udp_dport'} || '???';
+    }
+
+    return '???';
+}
+
+sub destination
+    # Obfuscates, as specified, the target IP address.
+    # Parameters:
+    # - reference to configuration hash
+    # - reference to entry hash
+    # Returns: (posibly) obfuscated target IP address
+{
+    my ($cref, $eref) = @_;
+
+    my $ip;
+
+    if ($cref->{'obfuscation'} eq 'complete')
+    {
+        $ip = $OBFUS_IP;
+    }
+    else
+    {
+        $ip = inet_ntoa( (pack("N", $eref->{'ip_daddr'})) );
+
+        $ip =~ s/^\d+/$OBFUS_IP_FIRST/e
+                if ($cref->{'obfuscation'} eq 'partial');
+    }
+
+    return $ip;
+}
+
+sub protocol
+    # Translates the protocol to its humanesque (?) form.
+    # Parameters:
+    # - reference to entry hash
+    # Returns: protocol (descriptive)
+{
+    my ($ref) = @_;
+
+    for ( $ref->{'ip_protocol'} )
+    {
+        /^1$/  and return 'ICMP';
+        /^2$/  and return 'IGMP';
+        /^6$/  and return 'TCP';
+        /^17$/ and return 'UDP';
+        return $_;
+    }
+
+    return '???';
+}
+
+sub tcp_flags
+    # For tcp entries, builds a string that indicates the tcp flags that
+    # were set.
+    # Parameters:
+    # - reference to entry hash
+    # Returns: tcp flag string per dshield.org
+{
+    my ($ref) = @_;
+
+    return ' ' if ($ref->{'ip_protocol'} != 6);
+
+    my $flags = '';
+
+    $flags .= 'S'  if (defined($ref->{'tcp_syn'}));
+    $flags .= 'A'  if (defined($ref->{'tcp_ack'}));
+    $flags .= 'F'  if (defined($ref->{'tcp_fin'}));
+    $flags .= 'U'  if (defined($ref->{'tcp_urg'}));
+    $flags .= 'R'  if (defined($ref->{'tcp_res'}));
+    $flags .= 'P'  if (defined($ref->{'tcp_psh'}));
+
+    return $flags;
+}
+
+sub printList
+    # Prints-out the original and formatted entries for debugging purposes.
+    # Parameters:
+    # - reference to database entries array
+    # - reference to dshield entries array
+    # Returns: void
+{
+    my ($dbref, $eref) = @_;
+
+    my ($i, $num);
+
+    $num = scalar ( @{ $dbref } );
+
+    for ($i = 0; $i < $num; $i++)
+    {
+        foreach (keys %{ $dbref->[$i] })
+        {
+            print STDERR $_, ' : ', $dbref->[$i]->{$_}, "\n"
+                if (defined($dbref->[$i]->{$_}));
+        }
+        print STDERR join("\t", @{ $eref->[$i]} ), "\n";
+    }
+}
+
+sub sendEntryList
+    # Send the entry list to the eMail address specified.
+    # Parameters:
+    # - reference to configuration hash
+    # - reference to arrays of dshield entries
+    # Returns: void
+{
+    my ($cref, $eref) = @_;
+
+    my $fd;
+    my $entry;
+
+    return if (scalar(@{ $eref }) <= 0);
+
+    open($fd, '|' . $cref->{'mailer'} . '  -t') ||
+            fatalReport("Unable to open the mailer: " . $cref->{'mailer'} .
+                        " : $!");
+
+    # add headers
+    print $fd 'To: ' . $cref->{'email'} . "\n";
+    if (defined($cref->{'cc'}))
+    {
+        print $fd 'Cc: ' . $cref->{'cc'} . "\n";
+    }
+
+    print $fd 'Subject: FORMAT DSHIELD USERID ', $cref->{'userid'},
+              ' TZ +00:00 ', $Prog, ' ', $VERSION, "\n\n";
+
+    foreach $entry (@{ $eref })
+    {
+        print $fd join("\t", @{ $entry }), "\n";
+    }
+
+    close($fd); # send it!
+}
+
+#########################################################################
+# Routines to check and update the period over which logs were sent to
+# prevent duplicate log entries from hitting dshield.org.
+#########################################################################
+
+sub checkPeriod
+    # Determines the maximum period in the past that the script can scrape
+    # the database so as to not send duplicate entries to dshield.org.
+    # Parameters:
+    # - reference to configuration hash
+    # Returns: period, in seconds, to look back in database for entries
+{
+    my ($ref) = @_;
+
+    my ($fd, $last_secs);
+
+    my $path   =  $ref->{'cache'} . '/' . CACHE_FILE;
+    my $period = $ref->{'maxperiod'} * 3600;
+
+    # check if we have data from the last send
+    return ($period) if (! -f $path);
+
+    open($fd, '<', $path) ||
+            fatalReport("$path: unable to open cache file : $!");
+    $last_secs = <$fd>;
+    close($fd);
+
+    return ($period) if ($last_secs !~ /\d+/);
+
+    if ($Now_secs - $last_secs >= $period)
+    {   # first time, or the box was down?
+        return $period;
+    }
+
+    return ($Now_secs - $last_secs);
+}
+
+sub updatePeriod
+    # Saves the time the script scraped the database so as to not send
+    # duplicate entries to dshield.org.
+    # Parameters:
+    # - reference to configuration hash
+    # Returns: void
+{
+    my ($ref) = @_;
+
+    my $fd;
+
+    my $path   =  $ref->{'cache'} . '/' . CACHE_FILE;
+
+    open($fd, '>', $path) ||
+            fatalReport("$path: unable to open cache file : $!");
+    print $fd $Now_secs;
+    close($fd);
+}
+
+
+# DSHIELD-ULOG
+# Copyright (C) 2003 John W. Palmieri (john@mediaOnFire.com)
+# 
+# This is open source / free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA
